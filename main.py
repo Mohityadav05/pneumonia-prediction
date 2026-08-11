@@ -2,24 +2,34 @@
 Pneumonia Detection + RAG Patient Assistant — Flask app
 
 Two capabilities on one page:
-1. Upload a chest X-ray -> model predicts NORMAL / PNEUMONIA + confidence
+1. Upload a chest X-ray -> TFLite model predicts NORMAL / PNEUMONIA + confidence
 2. Ask questions about precautions/medications -> RAG retrieves relevant
-   context from rag_docs/ and an LLM answers grounded in that context.
+   context from rag_docs/ and Gemini/Anthropic LLM answers grounded in that context.
 
-Env var required: ANTHROPIC_API_KEY
-pip install flask tensorflow anthropic sentence-transformers faiss-cpu pillow
+Env var required: GEMINI_API_KEY (or ANTHROPIC_API_KEY)
+pip install flask tflite-runtime anthropic google-genai sentence-transformers faiss-cpu pillow numpy gunicorn
 """
 
 import os
 import pickle
 import numpy as np
 from flask import Flask, render_template, request, send_from_directory, jsonify
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.applications.vgg16 import preprocess_input
+from PIL import Image
+
+# ---- TFLite inference (lightweight, no full TensorFlow needed) ----
+try:
+    import tflite_runtime.interpreter as tflite
+    USE_TFLITE_RUNTIME = True
+except ImportError:
+    # Fallback: full TensorFlow TFLite interpreter
+    import tensorflow as tf
+    tflite = tf.lite
+    USE_TFLITE_RUNTIME = False
+
 from sentence_transformers import SentenceTransformer
 import faiss
 import anthropic
+
 try:
     from google import genai
     from google.genai import types
@@ -36,15 +46,59 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 IMG_SIZE = 150
 TOP_K = 3  # retrieved chunks per query
 
-# ---- Load prediction model ----
-model = load_model("models/pneumonia_model.h5")
-class_labels = ["NORMAL", "PNEUMONIA"]
+# ---- Load TFLite prediction model ----
+TFLITE_MODEL_PATH = "models/pneumonia_model.tflite"
+H5_MODEL_PATH = "models/pneumonia_model.h5"
 
-# ---- Load RAG index ----
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-rag_index = faiss.read_index("rag_index.faiss")
-with open("rag_chunks.pkl", "rb") as f:
-    rag_chunks = pickle.load(f)
+# Lazy-loaded globals
+_interpreter = None
+_input_details = None
+_output_details = None
+_embedder = None
+_rag_index = None
+_rag_chunks = None
+
+
+def get_interpreter():
+    global _interpreter, _input_details, _output_details
+    if _interpreter is None:
+        if os.path.exists(TFLITE_MODEL_PATH):
+            if USE_TFLITE_RUNTIME:
+                _interpreter = tflite.Interpreter(model_path=TFLITE_MODEL_PATH)
+            else:
+                _interpreter = tflite.Interpreter(model_path=TFLITE_MODEL_PATH)
+            _interpreter.allocate_tensors()
+            _input_details = _interpreter.get_input_details()
+            _output_details = _interpreter.get_output_details()
+            print(f"TFLite model loaded from {TFLITE_MODEL_PATH}")
+        else:
+            # Fallback: load H5 with full TF
+            import tensorflow as tf
+            model = tf.keras.models.load_model(H5_MODEL_PATH)
+            _interpreter = model  # store keras model as fallback
+            print(f"H5 model loaded (TFLite not found) from {H5_MODEL_PATH}")
+    return _interpreter
+
+
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        print("Sentence embedder loaded")
+    return _embedder
+
+
+def get_rag():
+    global _rag_index, _rag_chunks
+    if _rag_index is None:
+        _rag_index = faiss.read_index("rag_index.faiss")
+        with open("rag_chunks.pkl", "rb") as f:
+            _rag_chunks = pickle.load(f)
+        print("RAG index loaded")
+    return _rag_index, _rag_chunks
+
+
+class_labels = ["NORMAL", "PNEUMONIA"]
 
 # ---- LLM System Prompt ----
 SYSTEM_PROMPT = """You are a patient education assistant for a pneumonia care app.
@@ -63,13 +117,32 @@ Rules you must always follow:
 """
 
 
-def predict_pneumonia(image_path):
-    img = load_img(image_path, target_size=(IMG_SIZE, IMG_SIZE))
-    img_array = img_to_array(img)
-    img_array = preprocess_input(img_array)
-    img_array = np.expand_dims(img_array, axis=0)
+def vgg16_preprocess(img_array):
+    """VGG16 preprocessing: convert RGB to BGR, zero-center by ImageNet mean."""
+    img_array = img_array[..., ::-1]  # RGB -> BGR
+    mean = np.array([103.939, 116.779, 123.68], dtype=np.float32)
+    img_array -= mean
+    return img_array
 
-    prediction = model.predict(img_array)[0][0]  # sigmoid output, 0-1
+
+def predict_pneumonia(image_path):
+    # Load and resize image
+    img = Image.open(image_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+    img_array = np.array(img, dtype=np.float32)
+    img_array = vgg16_preprocess(img_array)
+    img_array = np.expand_dims(img_array, axis=0)  # shape: (1, 150, 150, 3)
+
+    interp = get_interpreter()
+
+    if _input_details is not None:
+        # TFLite path
+        interp.set_tensor(_input_details[0]["index"], img_array)
+        interp.invoke()
+        prediction = interp.get_tensor(_output_details[0]["index"])[0][0]
+    else:
+        # Keras fallback
+        prediction = interp.predict(img_array)[0][0]
+
     if prediction >= 0.5:
         return "PNEUMONIA", float(prediction)
     else:
@@ -77,6 +150,8 @@ def predict_pneumonia(image_path):
 
 
 def retrieve_context(query, k=TOP_K):
+    embedder = get_embedder()
+    rag_index, rag_chunks = get_rag()
     query_vec = embedder.encode([query]).astype("float32")
     distances, indices = rag_index.search(query_vec, k)
     retrieved = [rag_chunks[i] for i in indices[0] if i < len(rag_chunks)]
