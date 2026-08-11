@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pneumonia Detection Assistant</title>
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; color: #222; }
+  h1 { font-size: 22px; }
+  .card { border: 1px solid #ddd; border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+  .result { font-size: 18px; font-weight: 600; margin-top: 10px; }
+  .PNEUMONIA { color: #c0392b; }
+  .NORMAL { color: #27ae60; }
+  img.preview { max-width: 100%; border-radius: 8px; margin-top: 10px; }
+  #chat-log { min-height: 120px; max-height: 320px; overflow-y: auto; border: 1px solid #eee; border-radius: 8px; padding: 12px; margin-bottom: 10px; background: #fafafa; }
+  .msg-user { text-align: right; margin: 6px 0; }
+  .msg-bot { text-align: left; margin: 6px 0; }
+  .bubble { display: inline-block; padding: 8px 12px; border-radius: 10px; max-width: 85%; }
+  .msg-user .bubble { background: #dbe9ff; }
+  .msg-bot .bubble { background: #eee; }
+  .sources { font-size: 11px; color: #888; margin-top: 2px; }
+  #question { width: 78%; padding: 8px; }
+  button { padding: 8px 14px; }
+  .disclaimer { font-size: 12px; color: #888; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<h1>Pneumonia Detection Assistant</h1>
+
+<div class="card">
+  <h3>1. Upload a chest X-ray</h3>
+  <form method="POST" enctype="multipart/form-data">
+    <input type="file" name="file" accept="image/*" required>
+    <button type="submit">Analyze</button>
+  </form>
+
+  {% if result %}
+    <div class="result {{ result }}">Result: {{ result }} (confidence: {{ confidence }})</div>
+    <img class="preview" src="{{ file_path }}" alt="Uploaded X-ray">
+    <p class="disclaimer">This is an AI-generated screening result, not a medical diagnosis. Please consult a doctor.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3>2. Ask about precautions or your prescription</h3>
+  <div id="chat-log"></div>
+  <input type="text" id="question" placeholder="e.g. What should I do while recovering from pneumonia?">
+  <button onclick="sendQuestion()">Ask</button>
+  <p class="disclaimer">Answers are for general education only and are not medical advice. Always consult a doctor or pharmacist about your specific situation.</p>
+</div>
+
+<script>
+async function sendQuestion() {
+  const input = document.getElementById('question');
+  const question = input.value.trim();
+  if (!question) return;
+
+  const log = document.getElementById('chat-log');
+  log.innerHTML += `<div class="msg-user"><span class="bubble">${question}</span></div>`;
+  input.value = '';
+  log.scrollTop = log.scrollHeight;
+
+  const res = await fetch('/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question })
+  });
+  const data = await res.json();
+
+  if (data.error) {
+    log.innerHTML += `<div class="msg-bot"><span class="bubble">Error: ${data.error}</span></div>`;
+  } else {
+    log.innerHTML += `<div class="msg-bot"><span class="bubble">${data.answer}</span>
+      <div class="sources">Sources: ${data.sources.join(', ')}</div></div>`;
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('question').addEventListener('keypress', function(e) {
+  if (e.key === 'Enter') sendQuestion();
+});
+</script>
+
+</body>
+</html>

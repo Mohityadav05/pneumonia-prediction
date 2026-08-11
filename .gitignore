@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables & virtual environments
+.env
+.venv
+venv/
+ENV/
+
+# Datasets & upload outputs
+chest_xray/
+uploads/
+
+# OS metadata
+.DS_Store
+Thumbs.db
