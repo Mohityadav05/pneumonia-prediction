@@ -7,4 +7,5 @@ anthropic
 google-genai
 pillow
 numpy
+gunicorn
 
