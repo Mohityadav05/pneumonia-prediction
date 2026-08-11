@@ -2,7 +2,7 @@
 Pneumonia Detection + RAG Patient Assistant — Flask app
 
 Two capabilities on one page:
-1. Upload a chest X-ray -> TFLite model predicts NORMAL / PNEUMONIA + confidence
+1. Upload a chest X-ray -> ONNX model predicts NORMAL / PNEUMONIA + confidence
 2. Ask questions about precautions/medications -> RAG retrieves relevant
    context from rag_docs/ and Gemini/Anthropic LLM answers grounded in that context.
 """
@@ -28,54 +28,39 @@ IMG_SIZE = 150
 TOP_K = 3  # retrieved chunks per query
 
 # ---- Absolute Paths for Models and Artifacts ----
-TFLITE_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.tflite")
+ONNX_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.onnx")
 H5_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.h5")
 FAISS_PATH = os.path.join(BASE_DIR, "rag_index.faiss")
 CHUNKS_PATH = os.path.join(BASE_DIR, "rag_chunks.pkl")
 
 # Lazy-loaded globals
-_interpreter = None
-_input_details = None
-_output_details = None
+_onnx_session = None
+_onnx_input_name = None
+_onnx_output_name = None
 _embedder = None
 _rag_index = None
 _rag_chunks = None
 
 
-def get_interpreter():
-    global _interpreter, _input_details, _output_details
-    if _interpreter is None:
-        # Try tflite_runtime first (installed on Render Linux), then fallback to tensorflow
-        tflite = None
-        try:
-            import tflite_runtime.interpreter as tflite_mod
-            tflite = tflite_mod
-        except ImportError:
-            try:
-                import tensorflow as tf
-                tflite = tf.lite
-            except ImportError:
-                pass
-
-        if tflite is not None and os.path.exists(TFLITE_MODEL_PATH):
-            _interpreter = tflite.Interpreter(model_path=TFLITE_MODEL_PATH)
-            _interpreter.allocate_tensors()
-            _input_details = _interpreter.get_input_details()
-            _output_details = _interpreter.get_output_details()
-            print(f"TFLite model loaded successfully from {TFLITE_MODEL_PATH}")
+def get_onnx_session():
+    global _onnx_session, _onnx_input_name, _onnx_output_name
+    if _onnx_session is None:
+        if os.path.exists(ONNX_MODEL_PATH):
+            import onnxruntime as ort
+            _onnx_session = ort.InferenceSession(ONNX_MODEL_PATH)
+            _onnx_input_name = _onnx_session.get_inputs()[0].name
+            _onnx_output_name = _onnx_session.get_outputs()[0].name
+            print(f"ONNX model loaded successfully from {ONNX_MODEL_PATH}")
         elif os.path.exists(H5_MODEL_PATH):
-            try:
-                import tensorflow as tf
-                model = tf.keras.models.load_model(H5_MODEL_PATH)
-                _interpreter = model
-                print(f"H5 Keras model loaded from {H5_MODEL_PATH}")
-            except Exception as e:
-                raise RuntimeError(f"Failed to load H5 model: {e}")
+            import tensorflow as tf
+            model = tf.keras.models.load_model(H5_MODEL_PATH)
+            _onnx_session = model
+            print(f"H5 Keras model loaded from {H5_MODEL_PATH}")
         else:
             raise FileNotFoundError(
-                f"No model found at {TFLITE_MODEL_PATH} or {H5_MODEL_PATH}"
+                f"No model found at {ONNX_MODEL_PATH} or {H5_MODEL_PATH}"
             )
-    return _interpreter
+    return _onnx_session
 
 
 def get_embedder():
@@ -95,7 +80,7 @@ def get_rag():
             raise FileNotFoundError(f"FAISS index missing at {FAISS_PATH}")
         if not os.path.exists(CHUNKS_PATH):
             raise FileNotFoundError(f"RAG chunks missing at {CHUNKS_PATH}")
-            
+
         _rag_index = faiss.read_index(FAISS_PATH)
         with open(CHUNKS_PATH, "rb") as f:
             _rag_chunks = pickle.load(f)
@@ -136,14 +121,15 @@ def predict_pneumonia(image_path):
     img_array = vgg16_preprocess(img_array)
     img_array = np.expand_dims(img_array, axis=0)  # shape: (1, 150, 150, 3)
 
-    interp = get_interpreter()
+    session = get_onnx_session()
 
-    if _input_details is not None:
-        interp.set_tensor(_input_details[0]["index"], img_array)
-        interp.invoke()
-        prediction = interp.get_tensor(_output_details[0]["index"])[0][0]
+    if _onnx_input_name is not None:
+        # ONNX Runtime inference
+        outputs = session.run([_onnx_output_name], {_onnx_input_name: img_array})
+        prediction = float(outputs[0][0][0])
     else:
-        prediction = interp.predict(img_array)[0][0]
+        # Keras fallback
+        prediction = float(session.predict(img_array)[0][0])
 
     if prediction >= 0.5:
         return "PNEUMONIA", float(prediction)
