@@ -40,9 +40,7 @@ rag_index = faiss.read_index("rag_index.faiss")
 with open("rag_chunks.pkl", "rb") as f:
     rag_chunks = pickle.load(f)
 
-# ---- LLM client ----
-claude = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
-
+# ---- LLM client initialization (lazy) ----
 SYSTEM_PROMPT = """You are a patient education assistant for a pneumonia care app.
 Answer ONLY using the CONTEXT provided below. If the context doesn't cover the
 question, say you don't have that information and recommend asking a doctor
@@ -81,22 +79,42 @@ def retrieve_context(query, k=TOP_K):
 
 def answer_with_rag(question):
     retrieved = retrieve_context(question)
+    sources = sorted(set(r["source"] for r in retrieved))
     context_text = "\n\n".join(f"[{r['source']}]: {r['text']}" for r in retrieved)
 
-    message = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=500,
-        system=SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": f"CONTEXT:\n{context_text}\n\nQUESTION: {question}",
-            }
-        ],
-    )
-    answer_text = "".join(block.text for block in message.content if block.type == "text")
-    sources = sorted(set(r["source"] for r in retrieved))
-    return answer_text, sources
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        # Fallback when ANTHROPIC_API_KEY is not configured
+        fallback_text = (
+            "*(Retrieved from medical knowledge base — set ANTHROPIC_API_KEY for AI summaries)*\n\n"
+            + "\n\n".join(f"• {r['text']}" for r in retrieved)
+            + "\n\n*Reminder: Always consult a healthcare professional or doctor regarding your specific situation.*"
+        )
+        return fallback_text, sources
+
+    try:
+        claude = anthropic.Anthropic(api_key=api_key)
+        message = claude.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=500,
+            system=SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"CONTEXT:\n{context_text}\n\nQUESTION: {question}",
+                }
+            ],
+        )
+        answer_text = "".join(block.text for block in message.content if block.type == "text")
+        return answer_text, sources
+    except Exception as e:
+        # If API call fails, return retrieved context gracefully
+        fallback_text = (
+            f"*(RAG Search Result)*\n\n"
+            + "\n\n".join(f"• {r['text']}" for r in retrieved)
+            + "\n\n*Reminder: Always consult a healthcare professional regarding your specific situation.*"
+        )
+        return fallback_text, sources
 
 
 @app.route("/", methods=["GET", "POST"])
