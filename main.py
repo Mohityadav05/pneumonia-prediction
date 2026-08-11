@@ -5,31 +5,35 @@ Two capabilities on one page:
 1. Upload a chest X-ray -> TFLite model predicts NORMAL / PNEUMONIA + confidence
 2. Ask questions about precautions/medications -> RAG retrieves relevant
    context from rag_docs/ and Gemini/Anthropic LLM answers grounded in that context.
-
-Env var required: GEMINI_API_KEY (or ANTHROPIC_API_KEY)
-pip install flask tflite-runtime anthropic google-genai sentence-transformers faiss-cpu pillow numpy gunicorn
 """
 
 import os
+import sys
 import pickle
+import traceback
 import numpy as np
 from flask import Flask, render_template, request, send_from_directory, jsonify
 from PIL import Image
 
 app = Flask(__name__)
 
+# ---- Base Directory for Absolute Paths ----
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ---- Config ----
-UPLOAD_FOLDER = "./uploads"
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 IMG_SIZE = 150
 TOP_K = 3  # retrieved chunks per query
 
-# ---- Load TFLite prediction model ----
-TFLITE_MODEL_PATH = "models/pneumonia_model.tflite"
-H5_MODEL_PATH = "models/pneumonia_model.h5"
+# ---- Absolute Paths for Models and Artifacts ----
+TFLITE_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.tflite")
+H5_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.h5")
+FAISS_PATH = os.path.join(BASE_DIR, "rag_index.faiss")
+CHUNKS_PATH = os.path.join(BASE_DIR, "rag_chunks.pkl")
 
-# Lazy-loaded globals (for fast instant startup and port binding)
+# Lazy-loaded globals
 _interpreter = None
 _input_details = None
 _output_details = None
@@ -41,25 +45,36 @@ _rag_chunks = None
 def get_interpreter():
     global _interpreter, _input_details, _output_details
     if _interpreter is None:
+        # Try tflite_runtime first (installed on Render Linux), then fallback to tensorflow
+        tflite = None
         try:
-            import tflite_runtime.interpreter as tflite
-            use_tflite_runtime = True
+            import tflite_runtime.interpreter as tflite_mod
+            tflite = tflite_mod
         except ImportError:
-            import tensorflow as tf
-            tflite = tf.lite
-            use_tflite_runtime = False
+            try:
+                import tensorflow as tf
+                tflite = tf.lite
+            except ImportError:
+                pass
 
-        if os.path.exists(TFLITE_MODEL_PATH):
+        if tflite is not None and os.path.exists(TFLITE_MODEL_PATH):
             _interpreter = tflite.Interpreter(model_path=TFLITE_MODEL_PATH)
             _interpreter.allocate_tensors()
             _input_details = _interpreter.get_input_details()
             _output_details = _interpreter.get_output_details()
-            print(f"TFLite model loaded from {TFLITE_MODEL_PATH}")
+            print(f"TFLite model loaded successfully from {TFLITE_MODEL_PATH}")
+        elif os.path.exists(H5_MODEL_PATH):
+            try:
+                import tensorflow as tf
+                model = tf.keras.models.load_model(H5_MODEL_PATH)
+                _interpreter = model
+                print(f"H5 Keras model loaded from {H5_MODEL_PATH}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load H5 model: {e}")
         else:
-            import tensorflow as tf
-            model = tf.keras.models.load_model(H5_MODEL_PATH)
-            _interpreter = model
-            print(f"H5 model loaded (TFLite not found) from {H5_MODEL_PATH}")
+            raise FileNotFoundError(
+                f"No model found at {TFLITE_MODEL_PATH} or {H5_MODEL_PATH}"
+            )
     return _interpreter
 
 
@@ -76,8 +91,13 @@ def get_rag():
     global _rag_index, _rag_chunks
     if _rag_index is None:
         import faiss
-        _rag_index = faiss.read_index("rag_index.faiss")
-        with open("rag_chunks.pkl", "rb") as f:
+        if not os.path.exists(FAISS_PATH):
+            raise FileNotFoundError(f"FAISS index missing at {FAISS_PATH}")
+        if not os.path.exists(CHUNKS_PATH):
+            raise FileNotFoundError(f"RAG chunks missing at {CHUNKS_PATH}")
+            
+        _rag_index = faiss.read_index(FAISS_PATH)
+        with open(CHUNKS_PATH, "rb") as f:
             _rag_chunks = pickle.load(f)
         print("RAG index loaded")
     return _rag_index, _rag_chunks
@@ -198,20 +218,28 @@ def answer_with_rag(question):
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    result, confidence, file_path = None, None, None
+    result, confidence, file_path, error_msg = None, None, None, None
     if request.method == "POST":
-        file = request.files.get("file")
-        if file:
-            file_location = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
-            file.save(file_location)
-            result, confidence = predict_pneumonia(file_location)
-            file_path = f"/uploads/{file.filename}"
+        try:
+            file = request.files.get("file")
+            if file and file.filename != "":
+                file_location = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
+                file.save(file_location)
+                result, confidence = predict_pneumonia(file_location)
+                file_path = f"/uploads/{file.filename}"
+            else:
+                error_msg = "Please select an X-ray image file to upload."
+        except Exception as e:
+            print("Error during image prediction:")
+            traceback.print_exc()
+            error_msg = f"Prediction Error: {str(e)}"
 
     return render_template(
         "index.html",
         result=result,
-        confidence=f"{confidence*100:.2f}%" if confidence else None,
+        confidence=f"{confidence*100:.2f}%" if confidence is not None else None,
         file_path=file_path,
+        error_msg=error_msg,
     )
 
 
@@ -236,6 +264,7 @@ def chat():
         answer, sources = answer_with_rag(question)
         return jsonify({"answer": answer, "sources": sources})
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
