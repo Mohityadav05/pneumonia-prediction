@@ -16,27 +16,6 @@ import numpy as np
 from flask import Flask, render_template, request, send_from_directory, jsonify
 from PIL import Image
 
-# ---- TFLite inference (lightweight, no full TensorFlow needed) ----
-try:
-    import tflite_runtime.interpreter as tflite
-    USE_TFLITE_RUNTIME = True
-except ImportError:
-    # Fallback: full TensorFlow TFLite interpreter
-    import tensorflow as tf
-    tflite = tf.lite
-    USE_TFLITE_RUNTIME = False
-
-from sentence_transformers import SentenceTransformer
-import faiss
-import anthropic
-
-try:
-    from google import genai
-    from google.genai import types
-    HAS_GEMINI = True
-except ImportError:
-    HAS_GEMINI = False
-
 app = Flask(__name__)
 
 # ---- Config ----
@@ -50,7 +29,7 @@ TOP_K = 3  # retrieved chunks per query
 TFLITE_MODEL_PATH = "models/pneumonia_model.tflite"
 H5_MODEL_PATH = "models/pneumonia_model.h5"
 
-# Lazy-loaded globals
+# Lazy-loaded globals (for fast instant startup and port binding)
 _interpreter = None
 _input_details = None
 _output_details = None
@@ -62,20 +41,24 @@ _rag_chunks = None
 def get_interpreter():
     global _interpreter, _input_details, _output_details
     if _interpreter is None:
+        try:
+            import tflite_runtime.interpreter as tflite
+            use_tflite_runtime = True
+        except ImportError:
+            import tensorflow as tf
+            tflite = tf.lite
+            use_tflite_runtime = False
+
         if os.path.exists(TFLITE_MODEL_PATH):
-            if USE_TFLITE_RUNTIME:
-                _interpreter = tflite.Interpreter(model_path=TFLITE_MODEL_PATH)
-            else:
-                _interpreter = tflite.Interpreter(model_path=TFLITE_MODEL_PATH)
+            _interpreter = tflite.Interpreter(model_path=TFLITE_MODEL_PATH)
             _interpreter.allocate_tensors()
             _input_details = _interpreter.get_input_details()
             _output_details = _interpreter.get_output_details()
             print(f"TFLite model loaded from {TFLITE_MODEL_PATH}")
         else:
-            # Fallback: load H5 with full TF
             import tensorflow as tf
             model = tf.keras.models.load_model(H5_MODEL_PATH)
-            _interpreter = model  # store keras model as fallback
+            _interpreter = model
             print(f"H5 model loaded (TFLite not found) from {H5_MODEL_PATH}")
     return _interpreter
 
@@ -83,6 +66,7 @@ def get_interpreter():
 def get_embedder():
     global _embedder
     if _embedder is None:
+        from sentence_transformers import SentenceTransformer
         _embedder = SentenceTransformer("all-MiniLM-L6-v2")
         print("Sentence embedder loaded")
     return _embedder
@@ -91,6 +75,7 @@ def get_embedder():
 def get_rag():
     global _rag_index, _rag_chunks
     if _rag_index is None:
+        import faiss
         _rag_index = faiss.read_index("rag_index.faiss")
         with open("rag_chunks.pkl", "rb") as f:
             _rag_chunks = pickle.load(f)
@@ -126,7 +111,6 @@ def vgg16_preprocess(img_array):
 
 
 def predict_pneumonia(image_path):
-    # Load and resize image
     img = Image.open(image_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
     img_array = np.array(img, dtype=np.float32)
     img_array = vgg16_preprocess(img_array)
@@ -135,12 +119,10 @@ def predict_pneumonia(image_path):
     interp = get_interpreter()
 
     if _input_details is not None:
-        # TFLite path
         interp.set_tensor(_input_details[0]["index"], img_array)
         interp.invoke()
         prediction = interp.get_tensor(_output_details[0]["index"])[0][0]
     else:
-        # Keras fallback
         prediction = interp.predict(img_array)[0][0]
 
     if prediction >= 0.5:
@@ -165,8 +147,10 @@ def answer_with_rag(question):
 
     # 1. Check for Gemini API key
     gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if gemini_key and HAS_GEMINI:
+    if gemini_key:
         try:
+            from google import genai
+            from google.genai import types
             client = genai.Client(api_key=gemini_key)
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -185,6 +169,7 @@ def answer_with_rag(question):
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     if anthropic_key:
         try:
+            import anthropic
             claude = anthropic.Anthropic(api_key=anthropic_key)
             message = claude.messages.create(
                 model="claude-3-5-sonnet-20241022",
@@ -228,6 +213,11 @@ def index():
         confidence=f"{confidence*100:.2f}%" if confidence else None,
         file_path=file_path,
     )
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/uploads/<filename>")
