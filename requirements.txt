@@ -4,5 +4,7 @@ scikit-learn
 sentence-transformers
 faiss-cpu
 anthropic
+google-genai
 pillow
 numpy
+

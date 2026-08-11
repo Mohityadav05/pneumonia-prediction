@@ -20,6 +20,12 @@ from tensorflow.keras.applications.vgg16 import preprocess_input
 from sentence_transformers import SentenceTransformer
 import faiss
 import anthropic
+try:
+    from google import genai
+    from google.genai import types
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
 
 app = Flask(__name__)
 
@@ -40,7 +46,7 @@ rag_index = faiss.read_index("rag_index.faiss")
 with open("rag_chunks.pkl", "rb") as f:
     rag_chunks = pickle.load(f)
 
-# ---- LLM client initialization (lazy) ----
+# ---- LLM System Prompt ----
 SYSTEM_PROMPT = """You are a patient education assistant for a pneumonia care app.
 Answer ONLY using the CONTEXT provided below. If the context doesn't cover the
 question, say you don't have that information and recommend asking a doctor
@@ -82,39 +88,52 @@ def answer_with_rag(question):
     sources = sorted(set(r["source"] for r in retrieved))
     context_text = "\n\n".join(f"[{r['source']}]: {r['text']}" for r in retrieved)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        # Fallback when ANTHROPIC_API_KEY is not configured
-        fallback_text = (
-            "*(Retrieved from medical knowledge base — set ANTHROPIC_API_KEY for AI summaries)*\n\n"
-            + "\n\n".join(f"• {r['text']}" for r in retrieved)
-            + "\n\n*Reminder: Always consult a healthcare professional or doctor regarding your specific situation.*"
-        )
-        return fallback_text, sources
+    # 1. Check for Gemini API key
+    gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if gemini_key and HAS_GEMINI:
+        try:
+            client = genai.Client(api_key=gemini_key)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=f"CONTEXT:\n{context_text}\n\nQUESTION: {question}",
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0.3,
+                    max_output_tokens=600,
+                ),
+            )
+            return response.text, sources
+        except Exception as e:
+            print(f"Gemini API error: {e}")
 
-    try:
-        claude = anthropic.Anthropic(api_key=api_key)
-        message = claude.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=500,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"CONTEXT:\n{context_text}\n\nQUESTION: {question}",
-                }
-            ],
-        )
-        answer_text = "".join(block.text for block in message.content if block.type == "text")
-        return answer_text, sources
-    except Exception as e:
-        # If API call fails, return retrieved context gracefully
-        fallback_text = (
-            f"*(RAG Search Result)*\n\n"
-            + "\n\n".join(f"• {r['text']}" for r in retrieved)
-            + "\n\n*Reminder: Always consult a healthcare professional regarding your specific situation.*"
-        )
-        return fallback_text, sources
+    # 2. Check for Anthropic API key
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if anthropic_key:
+        try:
+            claude = anthropic.Anthropic(api_key=anthropic_key)
+            message = claude.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=500,
+                system=SYSTEM_PROMPT,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"CONTEXT:\n{context_text}\n\nQUESTION: {question}",
+                    }
+                ],
+            )
+            answer_text = "".join(block.text for block in message.content if block.type == "text")
+            return answer_text, sources
+        except Exception as e:
+            print(f"Anthropic API error: {e}")
+
+    # 3. Direct RAG Context Fallback (no API key required)
+    fallback_text = (
+        "*(Retrieved from medical knowledge base — set GEMINI_API_KEY or ANTHROPIC_API_KEY for AI synthesis)*\n\n"
+        + "\n\n".join(f"• {r['text']}" for r in retrieved)
+        + "\n\n*Reminder: Always consult a healthcare professional or doctor regarding your specific situation.*"
+    )
+    return fallback_text, sources
 
 
 @app.route("/", methods=["GET", "POST"])
