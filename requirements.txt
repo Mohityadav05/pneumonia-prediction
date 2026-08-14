@@ -1,11 +1,10 @@
 flask==3.1.0
 onnxruntime
 scikit-learn
-sentence-transformers
+fastembed
 faiss-cpu
 anthropic
 google-genai
 pillow
 numpy
 gunicorn
-

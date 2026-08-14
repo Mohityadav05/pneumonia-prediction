@@ -24,8 +24,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
 IMG_SIZE = 150
 TOP_K = 3  # retrieved chunks per query
+
+# FAISS uses squared L2 distance. Chunks whose distance exceeds this are
+# treated as "not relevant enough" and dropped, so the assistant can honestly
+# say "I don't have that information" instead of forcing an answer out of
+# unrelated chunks. Tune by printing distances for real queries and eyeballing
+# where good matches stop and junk starts.
+RELEVANCE_DISTANCE_THRESHOLD = 1.0
+
+# Must match EMBED_MODEL in build_rag_index.py exactly -- the FAISS index was
+# built in this model's vector space, so a mismatch here silently makes every
+# search result meaningless (not an error, just wrong/irrelevant chunks).
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
 # ---- Absolute Paths for Models and Artifacts ----
 ONNX_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.onnx")
@@ -66,9 +79,13 @@ def get_onnx_session():
 def get_embedder():
     global _embedder
     if _embedder is None:
-        from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
-        print("Sentence embedder loaded")
+        # fastembed runs the embedding model via onnxruntime, avoiding the
+        # torch dependency that was OOM-killing this app on Render's free
+        # 512MB instance (sentence-transformers pulls in torch, which is
+        # much heavier than the model itself needs to be for this use case).
+        from fastembed import TextEmbedding
+        _embedder = TextEmbedding(model_name=EMBED_MODEL)
+        print("fastembed embedder loaded")
     return _embedder
 
 
@@ -80,7 +97,6 @@ def get_rag():
             raise FileNotFoundError(f"FAISS index missing at {FAISS_PATH}")
         if not os.path.exists(CHUNKS_PATH):
             raise FileNotFoundError(f"RAG chunks missing at {CHUNKS_PATH}")
-
         _rag_index = faiss.read_index(FAISS_PATH)
         with open(CHUNKS_PATH, "rb") as f:
             _rag_chunks = pickle.load(f)
@@ -92,6 +108,7 @@ class_labels = ["NORMAL", "PNEUMONIA"]
 
 # ---- LLM System Prompt ----
 SYSTEM_PROMPT = """You are a patient education assistant for a pneumonia care app.
+
 Answer ONLY using the CONTEXT provided below. If the context doesn't cover the
 question, say you don't have that information and recommend asking a doctor
 or pharmacist.
@@ -122,7 +139,6 @@ def predict_pneumonia(image_path):
     img_array = np.expand_dims(img_array, axis=0)  # shape: (1, 150, 150, 3)
 
     session = get_onnx_session()
-
     if _onnx_input_name is not None:
         # ONNX Runtime inference
         outputs = session.run([_onnx_output_name], {_onnx_input_name: img_array})
@@ -140,14 +156,38 @@ def predict_pneumonia(image_path):
 def retrieve_context(query, k=TOP_K):
     embedder = get_embedder()
     rag_index, rag_chunks = get_rag()
-    query_vec = embedder.encode([query]).astype("float32")
+    # fastembed's .embed() returns a generator of numpy arrays, one per input
+    query_vec = np.array(list(embedder.embed([query]))).astype("float32")
     distances, indices = rag_index.search(query_vec, k)
-    retrieved = [rag_chunks[i] for i in indices[0] if i < len(rag_chunks)]
+
+    retrieved = []
+    for dist, idx in zip(distances[0], indices[0]):
+        # FAISS pads with -1 when the index has fewer than k vectors, or in
+        # some edge cases. Without this check, rag_chunks[-1] silently grabs
+        # the LAST chunk in the list instead of being skipped.
+        if idx == -1 or idx >= len(rag_chunks):
+            continue
+        # Drop chunks that are too far (semantically unrelated) so we don't
+        # feed the LLM irrelevant context it might answer from anyway.
+        if dist > RELEVANCE_DISTANCE_THRESHOLD:
+            continue
+        retrieved.append(rag_chunks[idx])
+
     return retrieved
 
 
 def answer_with_rag(question):
     retrieved = retrieve_context(question)
+
+    if not retrieved:
+        # Nothing relevant enough was found — be honest instead of forcing
+        # an answer, matching the SYSTEM_PROMPT's own instruction.
+        return (
+            "I don't have information on that in my current knowledge base. "
+            "Please check with a doctor or pharmacist for guidance on this.",
+            [],
+        )
+
     sources = sorted(set(r["source"] for r in retrieved))
     context_text = "\n\n".join(f"[{r['source']}]: {r['text']}" for r in retrieved)
 
@@ -157,6 +197,7 @@ def answer_with_rag(question):
         try:
             from google import genai
             from google.genai import types
+
             client = genai.Client(api_key=gemini_key)
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -176,9 +217,13 @@ def answer_with_rag(question):
     if anthropic_key:
         try:
             import anthropic
+
             claude = anthropic.Anthropic(api_key=anthropic_key)
             message = claude.messages.create(
-                model="claude-3-5-sonnet-20241022",
+                # claude-3-5-sonnet-20241022 was retired Oct 28, 2025 — every
+                # call to it errors out, which is what was silently breaking
+                # the RAG answers and dropping to the raw-chunk fallback below.
+                model="claude-sonnet-4-6",
                 max_tokens=500,
                 system=SYSTEM_PROMPT,
                 messages=[
@@ -193,7 +238,7 @@ def answer_with_rag(question):
         except Exception as e:
             print(f"Anthropic API error: {e}")
 
-    # 3. Direct RAG Context Fallback (no API key required)
+    # 3. Direct RAG Context Fallback (no API key required, or both calls failed)
     fallback_text = (
         "*(Retrieved from medical knowledge base — set GEMINI_API_KEY or ANTHROPIC_API_KEY for AI synthesis)*\n\n"
         + "\n\n".join(f"• {r['text']}" for r in retrieved)

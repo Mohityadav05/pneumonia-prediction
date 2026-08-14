@@ -2,22 +2,35 @@
 Builds a FAISS index over the docs in rag_docs/ for retrieval-augmented
 generation. Run this once (or whenever docs change) before starting main.py.
 
-pip install sentence-transformers faiss-cpu
+pip install fastembed faiss-cpu
+
+NOTE: this uses fastembed (ONNX-based) instead of sentence-transformers
+(torch-based) so the embedding model stays small enough to run comfortably
+on a free-tier host like Render's 512MB instance. main.py MUST use the same
+embedder/model for queries, since the index is built in that model's vector
+space -- if you change EMBED_MODEL here, re-run this script AND update
+main.py's EMBED_MODEL to match, or search results will be meaningless.
 """
 
 import os
 import glob
 import pickle
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 import faiss
+import numpy as np
 
 DOCS_DIR = "rag_docs"
 INDEX_OUT = "rag_index.faiss"
 CHUNKS_OUT = "rag_chunks.pkl"
-CHUNK_SIZE = 500     # characters per chunk
+CHUNK_SIZE = 500  # characters per chunk
 CHUNK_OVERLAP = 100
 
-embedder = SentenceTransformer("all-MiniLM-L6-v2")  # small, fast, good enough
+# small, fast, ONNX-based (no torch) -- 384-dim, same dimensionality as the
+# old all-MiniLM-L6-v2 model, but this one is loaded via onnxruntime so it
+# doesn't drag in torch's much larger memory footprint.
+EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+
+embedder = TextEmbedding(model_name=EMBED_MODEL)
 
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
@@ -41,8 +54,9 @@ def main():
 
     print(f"Built {len(all_chunks)} chunks from {DOCS_DIR}/")
 
-    embeddings = embedder.encode([c["text"] for c in all_chunks], show_progress_bar=True)
-    embeddings = embeddings.astype("float32")
+    # fastembed's .embed() returns a generator of numpy arrays, one per input
+    embeddings = list(embedder.embed([c["text"] for c in all_chunks]))
+    embeddings = np.array(embeddings).astype("float32")
 
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
