@@ -11,12 +11,24 @@ import os
 import sys
 import pickle
 import traceback
+import uuid
 import numpy as np
-from flask import Flask, render_template, request, send_from_directory, jsonify
+from flask import Flask, render_template, request, send_from_directory, jsonify, session
 from PIL import Image
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input as mobilenet_preprocess
 
+# NEW: SQLite logging (see db.py)
+from db import init_db, log_prediction, log_chat_message
+
 app = Flask(__name__)
+
+# NEW: needed so Flask can set a session cookie per browser, used to group
+# chat messages into a conversation in the chat_messages table.
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-in-production")
+
+# NEW: create predictions/chat_messages tables on startup if they don't exist yet.
+# Safe to call every time the app starts (CREATE TABLE IF NOT EXISTS).
+init_db()
 
 # ---- Base Directory for Absolute Paths ----
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -292,6 +304,21 @@ def index():
                 file.save(file_location)
                 result, confidence = predict_pneumonia(file_location)
                 file_path = f"/uploads/{file.filename}"
+
+                # NEW: log every prediction to SQLite (filename, label,
+                # confidence, and whether it passed the "is this an X-ray?"
+                # gate check). Wrapped in try/except so a logging failure
+                # never breaks the actual prediction response to the user.
+                try:
+                    log_prediction(
+                        filename=file.filename,
+                        predicted_label=result,
+                        confidence=float(confidence) if confidence is not None else 0.0,
+                        gate_passed=(result != "NOT_AN_XRAY"),
+                    )
+                except Exception:
+                    print("Warning: failed to log prediction to SQLite")
+                    traceback.print_exc()
             else:
                 error_msg = "Please select an X-ray image file to upload."
         except Exception as e:
@@ -329,8 +356,24 @@ def chat():
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
+    # NEW: give each browser session a stable id so chat_messages rows can
+    # be grouped into one conversation per user.
+    if "session_id" not in session:
+        session["session_id"] = str(uuid.uuid4())
+    session_id = session["session_id"]
+
     try:
         answer, sources = answer_with_rag(question)
+
+        # NEW: log both sides of the exchange to SQLite. Wrapped in
+        # try/except so a logging failure never breaks the chat response.
+        try:
+            log_chat_message(session_id, "user", question)
+            log_chat_message(session_id, "assistant", answer)
+        except Exception:
+            print("Warning: failed to log chat message to SQLite")
+            traceback.print_exc()
+
         return jsonify({"answer": answer, "sources": sources})
     except Exception as e:
         traceback.print_exc()
