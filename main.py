@@ -46,7 +46,7 @@ ONNX_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.onnx")
 H5_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.h5")
 FAISS_PATH = os.path.join(BASE_DIR, "rag_index.faiss")
 CHUNKS_PATH = os.path.join(BASE_DIR, "rag_chunks.pkl")
-GATE_MODEL_PATH = os.path.join(BASE_DIR, "models", "xray_gate.h5")
+GATE_MODEL_PATH = os.path.join(BASE_DIR, "models", "xray_gate.onnx")
 
 # Lazy-loaded globals
 _onnx_session = None
@@ -56,6 +56,8 @@ _embedder = None
 _rag_index = None
 _rag_chunks = None
 _gate_model = None
+_gate_input_name = None
+_gate_output_name = None
 
 
 def get_onnx_session():
@@ -80,11 +82,13 @@ def get_onnx_session():
 
 
 def get_gate_model():
-    global _gate_model
+    global _gate_model, _gate_input_name, _gate_output_name
     if _gate_model is None:
-        import tensorflow as tf
-        _gate_model = tf.keras.models.load_model(GATE_MODEL_PATH)
-        print("Gate model loaded")
+        import onnxruntime as ort
+        _gate_model = ort.InferenceSession(GATE_MODEL_PATH)
+        _gate_input_name = _gate_model.get_inputs()[0].name
+        _gate_output_name = _gate_model.get_outputs()[0].name
+        print("Gate model (ONNX) loaded")
     return _gate_model
 
 
@@ -153,7 +157,8 @@ def is_chest_xray(image_path, threshold=0.6):
     arr = mobilenet_preprocess(arr)
     arr = np.expand_dims(arr, axis=0)
     gate = get_gate_model()
-    score = float(gate.predict(arr, verbose=0)[0][0])
+    outputs = gate.run([_gate_output_name], {_gate_input_name: arr})
+    score = float(outputs[0][0][0])
     return score >= threshold, score
 
 
@@ -333,4 +338,4 @@ def chat():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(debug=True)
