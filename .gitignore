@@ -16,3 +16,8 @@ uploads/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+gate_data/
+app.db
+uploads/*
+!uploads/.gitkeep

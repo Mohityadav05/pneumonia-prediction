@@ -8,3 +8,4 @@ google-genai
 pillow
 numpy
 gunicorn
+tensorflow==2.20.0

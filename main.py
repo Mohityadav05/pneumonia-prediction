@@ -14,6 +14,7 @@ import traceback
 import numpy as np
 from flask import Flask, render_template, request, send_from_directory, jsonify
 from PIL import Image
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input as mobilenet_preprocess
 
 app = Flask(__name__)
 
@@ -45,6 +46,7 @@ ONNX_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.onnx")
 H5_MODEL_PATH = os.path.join(BASE_DIR, "models", "pneumonia_model.h5")
 FAISS_PATH = os.path.join(BASE_DIR, "rag_index.faiss")
 CHUNKS_PATH = os.path.join(BASE_DIR, "rag_chunks.pkl")
+GATE_MODEL_PATH = os.path.join(BASE_DIR, "models", "xray_gate.h5")
 
 # Lazy-loaded globals
 _onnx_session = None
@@ -53,6 +55,7 @@ _onnx_output_name = None
 _embedder = None
 _rag_index = None
 _rag_chunks = None
+_gate_model = None
 
 
 def get_onnx_session():
@@ -74,6 +77,15 @@ def get_onnx_session():
                 f"No model found at {ONNX_MODEL_PATH} or {H5_MODEL_PATH}"
             )
     return _onnx_session
+
+
+def get_gate_model():
+    global _gate_model
+    if _gate_model is None:
+        import tensorflow as tf
+        _gate_model = tf.keras.models.load_model(GATE_MODEL_PATH)
+        print("Gate model loaded")
+    return _gate_model
 
 
 def get_embedder():
@@ -132,7 +144,24 @@ def vgg16_preprocess(img_array):
     return img_array
 
 
+def is_chest_xray(image_path, threshold=0.6):
+    """Gate check: is this image even a chest X-ray? Runs before the
+    pneumonia model so random/unrelated photos don't get a confident
+    (and meaningless) PNEUMONIA/NORMAL score."""
+    img = Image.open(image_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+    arr = np.array(img, dtype=np.float32)
+    arr = mobilenet_preprocess(arr)
+    arr = np.expand_dims(arr, axis=0)
+    gate = get_gate_model()
+    score = float(gate.predict(arr, verbose=0)[0][0])
+    return score >= threshold, score
+
+
 def predict_pneumonia(image_path):
+    is_xray, xray_score = is_chest_xray(image_path)
+    if not is_xray:
+        return "NOT_AN_XRAY", xray_score
+
     img = Image.open(image_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
     img_array = np.array(img, dtype=np.float32)
     img_array = vgg16_preprocess(img_array)
@@ -265,6 +294,10 @@ def index():
             traceback.print_exc()
             error_msg = f"Prediction Error: {str(e)}"
 
+    if result == "NOT_AN_XRAY":
+        error_msg = "This doesn't look like a chest X-ray. Please upload a valid chest X-ray image."
+        result, confidence = None, None
+
     return render_template(
         "index.html",
         result=result,
@@ -300,4 +333,4 @@ def chat():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
